@@ -35,6 +35,13 @@
 #include "osdep/timer.h"
 #include "osdep/threads.h"
 
+// Duration of the gain ramps used to avoid clicks when a device stream is
+// started or stopped abruptly (e.g. when switching the output device).
+#define AO_FADE_MS 10
+// Smoothing factor for the measured hardware playback rate. Small enough that
+// a single bogus device delay report cannot move the reconstructed clock.
+#define AO_CLOCK_DRIFT_ALPHA 0.02
+
 struct buffer_state {
     // Buffer and AO
     mp_mutex lock;
@@ -68,6 +75,23 @@ struct buffer_state {
                                 // and is considered as a temporary solution;
                                 // DO NOT USE IT IN OTHER PLACES.
 
+    // Self-clock for push AOs (driver->write). Instead of trusting the
+    // driver/device reported delay, which varies between sound cards and can
+    // be off by hundreds of ms, the position of the currently playing sample
+    // is reconstructed from the number of samples actually written and the
+    // system clock. The device reported delay is only consumed as a rate
+    // signal to follow genuine hardware clock drift, never to move the anchor.
+    bool clock_valid;           // the fields below are initialized
+    int64_t clock_start_ns;     // mp_time_ns() at which sample 0 of the
+                                // current device stream reaches the speaker
+    int64_t clock_pause_ns;     // mp_time_ns at a logical pause (0 if playing)
+    int64_t clock_written;      // samples handed to driver->write() in total
+    double clock_rate;          // measured device playback rate relative to
+                                // the system clock (1.0 = nominal)
+    int64_t clock_probe_ns;     // time of the last device delay probe
+    int64_t clock_probe_written;// clock_written at the last probe
+    double clock_probe_delay;   // device delay at the last probe (seconds)
+
     // "Push" AOs only (AOs with driver->write).
     bool recover_pause;         // non-hw_paused: needs to recover delay
     struct mp_pcm_state prepause_state;
@@ -81,6 +105,8 @@ struct buffer_state {
 };
 
 static MP_THREAD_VOID ao_thread(void *arg);
+
+static bool realloc_buf(struct ao *ao, int samples);
 
 void ao_wakeup(struct ao *ao)
 {
@@ -113,6 +139,89 @@ struct mp_async_queue *ao_get_queue(struct ao *ao)
 {
     struct buffer_state *p = ao->buffer_state;
     return p->queue;
+}
+
+// Multiply num_samples raw sample values starting at data by gain.
+static void scale_samples(void *data, int num_samples, int format, double gain)
+{
+    if (gain >= 0.9999)
+        return;
+    switch (af_fmt_from_planar(format)) {
+    case AF_FORMAT_U8:
+        for (int n = 0; n < num_samples; n++) {
+            uint8_t *d = data;
+            d[n] = MPCLAMP((int)lrint((d[n] - 128) * gain) + 128, 0, 255);
+        }
+        break;
+    case AF_FORMAT_S16:
+        for (int n = 0; n < num_samples; n++) {
+            int16_t *d = data;
+            d[n] = MPCLAMP((int)lrint(d[n] * gain), INT16_MIN, INT16_MAX);
+        }
+        break;
+    case AF_FORMAT_S32:
+        for (int n = 0; n < num_samples; n++) {
+            int32_t *d = data;
+            d[n] = MPCLAMP((int64_t)lrint(d[n] * gain),
+                           INT32_MIN, INT32_MAX);
+        }
+        break;
+    case AF_FORMAT_S64:
+        for (int n = 0; n < num_samples; n++) {
+            int64_t *d = data;
+            d[n] = MPCLAMP((int64_t)llrint((double)d[n] * gain),
+                           INT64_MIN, INT64_MAX);
+        }
+        break;
+    case AF_FORMAT_FLOAT:
+        for (int n = 0; n < num_samples; n++) {
+            float *d = data;
+            d[n] = (float)(d[n] * gain);
+        }
+        break;
+    case AF_FORMAT_DOUBLE:
+        for (int n = 0; n < num_samples; n++) {
+            double *d = data;
+            d[n] *= gain;
+        }
+        break;
+    default:;
+        // Compressed/unknown formats cannot be faded safely.
+    }
+}
+
+// Apply a linear gain ramp from gain0 to gain1 over samples frames. data is
+// laid out as consumed by driver->write() (interleaved or planar).
+static void apply_gain_ramp(struct ao *ao, void **data, int samples,
+                            double gain0, double gain1)
+{
+    if (!af_fmt_is_pcm(ao->format) || samples <= 0)
+        return;
+
+    bool planar = af_fmt_is_planar(ao->format);
+    int planes = planar ? ao->channels.num : 1;
+    int step = planar ? 1 : ao->channels.num;
+
+    // Keep the per-sample gain table small; long ramps are quantized onto it.
+    int table_size = MPMIN(samples, 256);
+    double *gains = talloc_array(NULL, double, table_size);
+    for (int n = 0; n < table_size; n++) {
+        double t = table_size > 1 ? n / (double)(table_size - 1) : 1.0;
+        gains[n] = gain0 + (gain1 - gain0) * t;
+    }
+
+    for (int n = 0; n < samples; n++) {
+        double gain = gains[(int64_t)n * (table_size - 1) /
+                            MPMAX(samples - 1, 1)];
+        if (gain >= 0.9999)
+            continue;
+        for (int pl = 0; pl < planes; pl++) {
+            char *base = (char *)data[pl] + n * step * ao->sstride;
+            scale_samples(base, step, ao->format, gain);
+        }
+    }
+
+    talloc_free(gains);
 }
 
 // Special behavior with data==NULL: caller uses p->pending.
@@ -292,6 +401,168 @@ int ao_control(struct ao *ao, enum aocontrol cmd, void *arg)
     return r;
 }
 
+// Re-initialize the self-clock against the device. Called when a new device
+// stream starts. dev_delay is the device reported latency of the first chunk.
+static void clock_anchor(struct ao *ao, double dev_delay)
+{
+    struct buffer_state *p = ao->buffer_state;
+
+    p->clock_valid = true;
+    p->clock_pause_ns = 0;
+    p->clock_written = 0;
+    p->clock_start_ns = mp_time_ns() + MP_TIME_S_TO_NS(MPMAX(dev_delay, 0));
+    p->clock_rate = 1.0;
+    p->clock_probe_ns = mp_time_ns();
+    p->clock_probe_written = 0;
+    p->clock_probe_delay = MPMAX(dev_delay, 0);
+}
+
+// Forget everything known about the device stream (underrun, reset, reload).
+static void clock_invalidate(struct ao *ao)
+{
+    struct buffer_state *p = ao->buffer_state;
+    p->clock_valid = false;
+    p->clock_pause_ns = 0;
+    p->clock_written = 0;
+}
+
+// Account for samples successfully handed to the device and track the actual
+// hardware playback rate. Only the *rate of change* of the device reported
+// delay is consumed; its absolute value is never fed back into the clock.
+// Therefore:
+//  - a sound card that consistently misreports a constant latency cannot move
+//    the clock after the initial anchor;
+//  - a sudden jump of the reported value (e.g. after switching the output
+//    device) yields an implausible rate sample, which is discarded;
+//  - genuine long-term hardware clock drift is still followed.
+static void clock_account(struct ao *ao, int samples, double dev_delay,
+                          bool dev_playing)
+{
+    struct buffer_state *p = ao->buffer_state;
+
+    if (samples <= 0 || p->clock_pause_ns)
+        return;
+
+    if (!p->clock_valid || !dev_playing) {
+        clock_anchor(ao, dev_delay);
+        p->clock_written = samples;
+        return;
+    }
+
+    p->clock_written += samples;
+
+    if (dev_delay < 0)
+        return;
+
+    int64_t now_ns = mp_time_ns();
+    int64_t dt_ns = now_ns - p->clock_probe_ns;
+    int64_t dw = p->clock_written - p->clock_probe_written;
+
+    // Need enough elapsed time and samples for a stable rate estimate, and
+    // skip probes taken while the device was not actually consuming data.
+    if (!dev_playing || dt_ns < MP_TIME_S_TO_NS(0.05) || dw <= 0)
+        return;
+
+    double dt = MP_TIME_NS_TO_S(dt_ns);
+    // Samples the device actually consumed during dt: the buffer fill level
+    // change is the difference of the reported delays plus what was queued.
+    double consumed = dw + (p->clock_probe_delay - dev_delay) *
+                          ao->samplerate;
+    double measured_rate = consumed / (dt * ao->samplerate);
+
+    // Discard implausible estimates (delay report glitch, underrun edge).
+    if (measured_rate <= 0.5 || measured_rate >= 2.0) {
+        p->clock_probe_ns = now_ns;
+        p->clock_probe_written = p->clock_written;
+        p->clock_probe_delay = dev_delay;
+        return;
+    }
+
+    // Exponential smoothing of the rate; the anchor itself never jumps.
+    p->clock_rate += AO_CLOCK_DRIFT_ALPHA * (measured_rate - p->clock_rate);
+
+    p->clock_probe_ns = now_ns;
+    p->clock_probe_written = p->clock_written;
+    p->clock_probe_delay = dev_delay;
+}
+
+// Current output latency in seconds, reconstructed from the actual output.
+// Falls back to the device reported delay until the first chunk is written.
+static double ao_self_clock_delay(struct ao *ao)
+{
+    struct buffer_state *p = ao->buffer_state;
+
+    if (!p->clock_valid || !p->clock_written) {
+        struct mp_pcm_state state;
+        get_dev_state(ao, &state);
+        return MPMAX(state.delay, 0);
+    }
+
+    int64_t now = p->clock_pause_ns ? p->clock_pause_ns : mp_time_ns();
+    int64_t last_end = p->clock_start_ns + MP_TIME_S_TO_NS(
+        p->clock_written / ((double)ao->samplerate * p->clock_rate));
+    double delay = MP_TIME_NS_TO_S(last_end - now);
+
+    // The device buffer cannot hold more than this many samples.
+    double max_delay = ao->device_buffer / (double)ao->samplerate;
+    return MPCLAMP(delay, 0, max_delay);
+}
+
+// Number of samples covered by the pop-suppression gain ramps.
+static int ao_fade_samples(struct ao *ao)
+{
+    return ao->samplerate * AO_FADE_MS / 1000;
+}
+
+// Queue a short silence tail before the device stream is dropped (device
+// switch / reset). The queued audio cannot be read back and faded in place,
+// so instead the last audible waveform is followed by a zero-level segment,
+// and the device is given a bounded amount of time to play the queued data
+// before the stream is torn down. The new stream then starts with a fade-in.
+// This avoids cutting a non-zero waveform, which is what produces the click.
+static void ao_fade_out_device(struct ao *ao)
+{
+    struct buffer_state *p = ao->buffer_state;
+
+    if (!af_fmt_is_pcm(ao->format))
+        return;
+
+    struct mp_pcm_state state;
+    get_dev_state(ao, &state);
+
+    // Cap the wait at the latency currently reported by the device, plus one
+    // fade period, so a wedged device can never block the AO thread for long.
+    int64_t deadline = mp_time_ns() + MP_TIME_S_TO_NS(
+        MPMAX(state.delay, 0) + AO_FADE_MS / 1000.0);
+
+    while (mp_time_ns() < deadline) {
+        get_dev_state(ao, &state);
+
+        // Nothing audible remains: the next samples written will start a
+        // zero-level segment, which the fade-in on the new stream handles.
+        if (state.queued_samples <= 0)
+            break;
+
+        if (state.free_samples > 0) {
+            int samples = MPMIN(state.free_samples, ao_fade_samples(ao));
+            if (realloc_buf(ao, samples)) {
+                void **planes =
+                    (void **)mp_aframe_get_data_rw(p->temp_buf);
+                if (planes) {
+                    mp_aframe_set_silence(p->temp_buf, 0, samples);
+                    ao->driver->write(ao, planes, samples);
+                }
+            }
+        }
+
+        int64_t remaining = deadline - mp_time_ns();
+        if (remaining <= 0)
+            break;
+        mp_cond_timedwait(&p->wakeup, &p->lock,
+                          MPMIN(remaining, MP_TIME_S_TO_NS(0.01)));
+    }
+}
+
 double ao_get_delay(struct ao *ao)
 {
     struct buffer_state *p = ao->buffer_state;
@@ -300,9 +571,7 @@ double ao_get_delay(struct ao *ao)
 
     double driver_delay;
     if (ao->driver->write) {
-        struct mp_pcm_state state;
-        get_dev_state(ao, &state);
-        driver_delay = state.delay;
+        driver_delay = ao_self_clock_delay(ao);
     } else {
         int64_t end = p->end_time_ns;
         int64_t now = mp_time_ns();
@@ -326,6 +595,9 @@ void ao_reset(struct ao *ao)
 
     mp_mutex_lock(&p->lock);
 
+    if (ao->driver->write && p->streaming && !ao->stream_silence)
+        ao_fade_out_device(ao);
+
     TA_FREEP(&p->pending);
     mp_async_queue_reset(p->queue);
     mp_filter_reset(p->filter_root);
@@ -346,6 +618,7 @@ void ao_reset(struct ao *ao)
     p->recover_pause = false;
     p->hw_paused = false;
     p->end_time_ns = 0;
+    clock_invalidate(ao);
 
     mp_mutex_unlock(&p->lock);
 
@@ -404,10 +677,15 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
                     get_dev_state(ao, &p->prepause_state);
                 if (ao->driver->set_pause && ao->driver->set_pause(ao, true)) {
                     p->hw_paused = true;
+                    // Freeze the reconstructed clock at the device position.
+                    if (p->clock_valid && !p->clock_pause_ns)
+                        p->clock_pause_ns = mp_time_ns();
                 } else {
+                    ao_fade_out_device(ao);
                     ao->driver->reset(ao);
                     p->streaming = false;
                     p->recover_pause = !ao->untimed;
+                    clock_invalidate(ao);
                 }
             } else if (ao->driver->reset || ao->driver->set_pause) {
                 // See ao_reset() why this is done outside of the lock.
@@ -419,8 +697,15 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
         wakeup = true;
     } else if (p->playing && p->paused && !paused) {
         if (ao->driver->write) {
-            if (p->hw_paused)
+            if (p->hw_paused) {
                 ao->driver->set_pause(ao, false);
+                // Shift the anchor by the time spent paused so the clock
+                // resumes with the same delay instead of jumping.
+                if (p->clock_valid && p->clock_pause_ns) {
+                    p->clock_start_ns += mp_time_ns() - p->clock_pause_ns;
+                    p->clock_pause_ns = 0;
+                }
+            }
             p->hw_paused = false;
         } else {
             if (!p->streaming)
@@ -673,8 +958,19 @@ static bool ao_play_data(struct ao *ao)
     }
 
     if (samples) {
+        bool started = !p->streaming;
+        int fade = 0;
+        // Fade in the first samples of a freshly started device stream so
+        // playback never begins on a non-zero waveform (avoids clicks after
+        // device switches and underrun recovery).
+        if (started && !ao->driver->write_frames && af_fmt_is_pcm(ao->format))
+            fade = MPMIN(samples, ao_fade_samples(ao));
+        if (fade > 0)
+            apply_gain_ramp(ao, planes, fade, 0.0, 1.0);
+
         MP_STATS(ao, "start ao fill");
-        if (!ao->driver->write(ao, planes, samples))
+        bool ok = ao->driver->write(ao, planes, samples);
+        if (!ok)
             MP_ERR(ao, "Error writing audio to device.\n");
         MP_STATS(ao, "end ao fill");
 
@@ -683,6 +979,19 @@ static bool ao_play_data(struct ao *ao)
             ao->driver->start(ao);
             p->streaming = true;
             state.playing = true;
+        }
+
+        if (ok && !ao->driver->write_frames) {
+            if (started) {
+                // Anchor the reconstructed clock to the first chunk using the
+                // device delay as the initial latency estimate. From here on
+                // the clock follows written samples and the measured hardware
+                // rate, independent of further delay reports.
+                clock_anchor(ao, state.delay);
+                p->clock_written = samples;
+            } else {
+                clock_account(ao, samples, state.delay, state.playing);
+            }
         }
     }
 
@@ -704,6 +1013,7 @@ eof:
     if (ao->untimed || !state.playing || ao->stream_silence) {
         p->streaming = state.playing && !ao->untimed;
         p->playing = false;
+        clock_invalidate(ao);
     }
     ao->wakeup_cb(ao->wakeup_ctx);
     // For ao_drain().
